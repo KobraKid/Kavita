@@ -155,8 +155,6 @@ export class ImageZoomDirective {
 
   /** Whether to lock scrolling when the image is zoomed in */
   @Input() lockScroll = true;
-  /** Whether to recenter the image when zooming out */
-  @Input() recenterOnZoomOut = true;
 
   /**
    * Handles mouse wheel events.
