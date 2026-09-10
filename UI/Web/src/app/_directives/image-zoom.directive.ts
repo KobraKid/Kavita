@@ -1,11 +1,12 @@
-import { DestroyRef, Directive, ElementRef, Input, inject } from '@angular/core';
+import { DestroyRef, Directive, ElementRef, Input, inject, signal } from '@angular/core';
 
 @Directive({
   selector: '[appImageZoom]',
   standalone: true,
   host: {
-    'style': 'touch-action: none; will-change: transform; transform-origin: center center;',
+    'style': 'touch-action: none; will-change: transform;',
     '[style.transform]': 'transform',
+    '[style.transform-origin]': 'transformOrigin',
     '[style.cursor]': 'cursor',
     '(wheel)': 'onWheel($event)',
     '(touchstart)': 'onTouchStart($event)',
@@ -96,6 +97,14 @@ export class ImageZoomDirective {
   private pinchMidpointX = 0;
   /** The midpoint Y-coordinate between the two fingers during a pinch gesture */
   private pinchMidpointY = 0;
+  /** The X translation when the current pinch gesture started */
+  private pinchStartTranslateX = 0;
+  /** The scroll position when the current pinch gesture started */
+  private pinchStartScrollTop = 0;
+  /** The midpoint X-coordinate when the current pinch gesture started */
+  private pinchStartMidpointX = 0;
+  /** The midpoint Y-coordinate when the current pinch gesture started */
+  private pinchStartMidpointY = 0;
   /** The starting X-coordinate for panning */
   private panStartX = 0;
   /** The starting Y-coordinate for panning */
@@ -104,6 +113,8 @@ export class ImageZoomDirective {
   private panStartTranslateX = 0;
   /** The starting translation on the Y-axis for panning */
   private panStartTranslateY = 0;
+  /** The scroll position at the start of an infinite-scroller pan */
+  private panStartScrollTop = 0;
   /** Whether the image is currently being panned */
   private isPanning = false;
   /** Whether to suppress the next click after a pan */
@@ -120,6 +131,8 @@ export class ImageZoomDirective {
   private lastPanTime = 0;
   /** The active inertial pan animation frame */
   private momentumFrame?: number;
+  /** The local Y coordinate captured when infinite-reader zoom begins */
+  private infiniteZoomFocalY?: number;
 
   /** The scalar for zooming with the mouse wheel */
   private readonly zoomScalar = 0.0015;
@@ -143,9 +156,13 @@ export class ImageZoomDirective {
   private readonly momentumMaxFrameTime = 32;
   /** The reference frame duration used by the decay rate */
   private readonly momentumReferenceFrameTime = 16;
+  /** Treat floating-point values this close to 1 as fully reset. */
+  private readonly zoomResetEpsilon = 0.000001;
 
   transform = 'translate3d(0, 0, 0) scale(1)';
+  transformOrigin = 'center center';
   cursor = 'default';
+  readonly zoomedIn = signal(false);
 
   @Input()
   set zoomResetKey(_: unknown) {
@@ -194,6 +211,10 @@ export class ImageZoomDirective {
       const midpoint = this.getMidpoint(event.touches[0], event.touches[1]);
       this.pinchMidpointX = midpoint.x;
       this.pinchMidpointY = midpoint.y;
+      this.pinchStartTranslateX = this.translateX;
+      this.pinchStartScrollTop = this.getInfiniteScrollTop();
+      this.pinchStartMidpointX = midpoint.x;
+      this.pinchStartMidpointY = midpoint.y;
       this.isPanning = false;
       return;
     }
@@ -217,7 +238,14 @@ export class ImageZoomDirective {
       const nextScale = this.scale * (nextDistance / this.pinchDistance);
       const midpoint = this.getMidpoint(event.touches[0], event.touches[1]);
       this.setScale(nextScale, midpoint.x, midpoint.y);
-      this.setPanByDelta(midpoint.x - this.pinchMidpointX, midpoint.y - this.pinchMidpointY, this.translateX, this.translateY);
+      if (this.isInfiniteScroller()) {
+        this.setInfinitePanByDelta(
+          midpoint.x - this.pinchStartMidpointX,
+          midpoint.y - this.pinchStartMidpointY,
+        );
+      } else {
+        this.setPanByDelta(midpoint.x - this.pinchMidpointX, midpoint.y - this.pinchMidpointY, this.translateX, this.translateY);
+      }
       this.pinchDistance = nextDistance;
       this.pinchMidpointX = midpoint.x;
       this.pinchMidpointY = midpoint.y;
@@ -323,7 +351,7 @@ export class ImageZoomDirective {
    * @returns 
    */
   onWindowTouchMove(event: TouchEvent): void {
-    if (event.touches.length !== 1 || !this.isPanning || !this.isZoomedIn()) {
+    if (!this.isPaginationEvent(event) || event.touches.length !== 1 || !this.isPanning || !this.isZoomedIn()) {
       return;
     }
 
@@ -352,6 +380,7 @@ export class ImageZoomDirective {
     this.scale = 1;
     this.translateX = 0;
     this.translateY = 0;
+    this.infiniteZoomFocalY = undefined;
     this.pinchDistance = 0;
     this.isPanning = false;
     this.updateTransform();
@@ -420,9 +449,36 @@ export class ImageZoomDirective {
     // divide by scale to translate from screen pixels to image pixels
     const imagePointX = (clientX - layoutCenterX - this.translateX) / previousScale;
     const imagePointY = (clientY - layoutCenterY - this.translateY) / previousScale;
+    const isReset = nextScaleClamped <= 1 + this.zoomResetEpsilon;
+
+    if (this.isInfiniteScroller()) {
+      const scrollTop = this.getInfiniteScrollTop();
+      if (isReset) {
+        this.scale = 1;
+        this.translateX = 0;
+        this.translateY = 0;
+        this.infiniteZoomFocalY = undefined;
+        this.updateTransform();
+        this.restoreInfiniteScrollTop(scrollTop);
+        return;
+      }
+
+      if (this.infiniteZoomFocalY === undefined || previousScale === 1) {
+        this.infiniteZoomFocalY = (clientY - rect.top) / previousScale;
+      }
+
+      this.scale = nextScaleClamped;
+
+      const focalTranslateX = clientX - layoutCenterX - imagePointX * nextScaleClamped;
+      [this.translateX] = this.clampTranslation(focalTranslateX, 0);
+      this.translateY = this.infiniteZoomFocalY * (1 - nextScaleClamped);
+      this.updateTransform();
+      this.restoreInfiniteScrollTop(scrollTop);
+      return;
+    }
 
     // User has zoomed all the way out, reset translation
-    if (nextScaleClamped === 1) {
+    if (isReset) {
       this.scale = 1;
       this.translateX = 0;
       this.translateY = 0;
@@ -456,6 +512,7 @@ export class ImageZoomDirective {
     // Save off where the image was translated at the start of the pan
     this.panStartTranslateX = this.translateX;
     this.panStartTranslateY = this.translateY;
+    this.panStartScrollTop = this.getInfiniteScrollTop();
     this.lastPanX = clientX;
     this.lastPanY = clientY;
     this.lastPanTime = performance.now();
@@ -508,27 +565,39 @@ export class ImageZoomDirective {
       (1 - this.minimumMomentumVelocityMultiplier) * flickFactor;
     this.panVelocityX *= velocityMultiplier * momentumSpeedBoost;
     this.panVelocityY *= velocityMultiplier * momentumSpeedBoost;
+    const useInfiniteScrollPan = this.isInfiniteScroller();
+    let momentumDeltaX = useInfiniteScrollPan ? this.lastPanX - this.panStartX : 0;
+    let momentumDeltaY = useInfiniteScrollPan ? this.lastPanY - this.panStartY : 0;
     let previousTime = performance.now();
     const animate = (time: number) => {
       const elapsed = Math.min(time - previousTime, this.momentumMaxFrameTime);
       previousTime = time;
-      const nextTranslateX = this.translateX + this.panVelocityX * elapsed;
-      const nextTranslateY = this.translateY + this.panVelocityY * elapsed;
-      const [clampedX, clampedY] = this.clampTranslation(nextTranslateX, nextTranslateY);
-      const hitHorizontalLimit = clampedX !== nextTranslateX;
-      const hitVerticalLimit = clampedY !== nextTranslateY;
+      if (useInfiniteScrollPan) {
+        this.isPanning = true;
+        momentumDeltaX += this.panVelocityX * elapsed;
+        momentumDeltaY += this.panVelocityY * elapsed;
+        this.setPanByDelta(momentumDeltaX, momentumDeltaY, this.panStartTranslateX, this.panStartTranslateY);
+      } else {
+        const nextTranslateX = this.translateX + this.panVelocityX * elapsed;
+        const nextTranslateY = this.translateY + this.panVelocityY * elapsed;
+        const [clampedX, clampedY] = this.clampTranslation(nextTranslateX, nextTranslateY);
+        const hitHorizontalLimit = clampedX !== nextTranslateX;
+        const hitVerticalLimit = clampedY !== nextTranslateY;
 
-      this.translateX = clampedX;
-      this.translateY = clampedY;
-      this.updateTransform();
+        this.translateX = clampedX;
+        this.translateY = clampedY;
+        this.updateTransform();
 
-      if (hitHorizontalLimit) this.panVelocityX = 0;
-      if (hitVerticalLimit) this.panVelocityY = 0;
+        if (hitHorizontalLimit) this.panVelocityX = 0;
+        if (hitVerticalLimit) this.panVelocityY = 0;
+      }
       this.panVelocityX *= Math.pow(momentumDecay, elapsed / this.momentumReferenceFrameTime);
       this.panVelocityY *= Math.pow(momentumDecay, elapsed / this.momentumReferenceFrameTime);
 
       if (Math.hypot(this.panVelocityX, this.panVelocityY) < this.momentumThreshold) {
         this.momentumFrame = undefined;
+        this.isPanning = false;
+        this.updateTransform();
         return;
       }
 
@@ -564,6 +633,7 @@ export class ImageZoomDirective {
     if (this.momentumFrame !== undefined) {
       cancelAnimationFrame(this.momentumFrame);
       this.momentumFrame = undefined;
+      this.isPanning = false;
     }
     this.panVelocityX = 0;
     this.panVelocityY = 0;
@@ -577,8 +647,74 @@ export class ImageZoomDirective {
    * @param startTranslateY The translation on the Y-axis to apply the delta to
    */
   private setPanByDelta(deltaX: number, deltaY: number, startTranslateX: number, startTranslateY: number): void {
+    if (this.isInfiniteScroller() && this.isPanning) {
+      const scrollElement = this.getInfiniteScrollElement();
+      if (scrollElement) {
+        const desiredScrollTop = this.panStartScrollTop - deltaY;
+        const maxScrollTop = Math.max(0, scrollElement.scrollHeight - scrollElement.clientHeight);
+        const nextScrollTop = Math.max(0, Math.min(maxScrollTop, desiredScrollTop));
+        scrollElement.scrollTop = nextScrollTop;
+      }
+
+      const [clampedX] = this.clampTranslation(startTranslateX + deltaX, startTranslateY);
+      this.translateX = clampedX;
+      this.translateY = startTranslateY;
+      this.updateTransform();
+      return;
+    }
+
     [this.translateX, this.translateY] = this.clampTranslation(startTranslateX + deltaX, startTranslateY + deltaY);
     this.updateTransform();
+  }
+
+  /** Pans the infinite reader with the movement of a pinch midpoint. */
+  private setInfinitePanByDelta(deltaX: number, deltaY: number): void {
+    const scrollElement = this.getInfiniteScrollElement();
+    if (scrollElement) {
+      const desiredScrollTop = this.pinchStartScrollTop - deltaY;
+      const maxScrollTop = Math.max(0, scrollElement.scrollHeight - scrollElement.clientHeight);
+      scrollElement.scrollTop = Math.max(0, Math.min(maxScrollTop, desiredScrollTop));
+    }
+
+    [this.translateX] = this.clampTranslation(this.pinchStartTranslateX + deltaX, this.translateY);
+    this.updateTransform();
+  }
+
+  /** Returns true for the vertical, continuously scrolling reader. */
+  private isInfiniteScroller(): boolean {
+    return !this.lockScroll;
+  }
+
+  /** Gets the scroll element used by the infinite reader. */
+  private getInfiniteScrollElement(): HTMLElement | undefined {
+    if (!this.isInfiniteScroller()) {
+      return undefined;
+    }
+
+    const document = this.element.nativeElement.ownerDocument;
+    const readingArea = this.element.nativeElement.closest<HTMLElement>('.reading-area');
+    const fullscreenElement = document.fullscreenElement;
+    if (fullscreenElement && readingArea && fullscreenElement.contains(readingArea)) {
+      return readingArea;
+    }
+
+    return document.body;
+  }
+
+  /** Gets the current scroll position used by the infinite reader. */
+  private getInfiniteScrollTop(): number {
+    return this.getInfiniteScrollElement()?.scrollTop ?? 0;
+  }
+
+  /** Restores the native scroll position after changing the transformed content. */
+  private restoreInfiniteScrollTop(scrollTop: number): void {
+    const scrollElement = this.getInfiniteScrollElement();
+    if (!scrollElement) {
+      return;
+    }
+
+    const maxScrollTop = Math.max(0, scrollElement.scrollHeight - scrollElement.clientHeight);
+    scrollElement.scrollTop = Math.max(0, Math.min(maxScrollTop, scrollTop));
   }
 
   /**
@@ -625,12 +761,17 @@ export class ImageZoomDirective {
    */
   private updateTransform(): void {
     this.transform = `translate3d(${this.translateX}px, ${this.translateY}px, 0) scale(${this.scale})`;
+    this.transformOrigin = this.isInfiniteScroller() ? 'center top' : 'center center';
     this.cursor = this.isZoomedIn() ? (this.isPanning ? 'grabbing' : 'grab') : 'default';
+    if (this.zoomedIn() !== this.isZoomedIn()) {
+      this.zoomedIn.set(this.isZoomedIn());
+    }
 
     // Apply immediately instead of waiting for next repaint
     this.element.nativeElement.style.transform = this.transform;
+    this.element.nativeElement.style.transformOrigin = this.transformOrigin;
     this.element.nativeElement.style.cursor = this.cursor;
-    
+
     this.updateOverflowState();
   }
 
@@ -640,8 +781,12 @@ export class ImageZoomDirective {
    * scrollbars from appearing when zooming in.
    */
   private updateOverflowState(): void {
-    if (!this.lockScroll) return;
-    
+    if (!this.lockScroll) {
+      const scrollElement = this.getInfiniteScrollElement();
+      scrollElement?.style.setProperty('overflow-anchor', 'none');
+      return;
+    }
+
     // Prevent unnecessary DOM manipulations
     const isZoomedIn = this.isZoomedIn();
     const wasZoomedIn = this.element.nativeElement.dataset['imagezoomedin'] === 'true';
@@ -729,6 +874,9 @@ export class ImageZoomDirective {
 
       this.scale = 1;
       this.updateOverflowState();
+      if (!this.lockScroll) {
+        this.getInfiniteScrollElement()?.style.removeProperty('overflow-anchor');
+      }
 
       // Remove document-level event listeners if this was the last instance
       if (ImageZoomDirective.instances.size === 0 && ImageZoomDirective.listenerDocument) {

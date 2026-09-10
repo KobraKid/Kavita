@@ -101,8 +101,10 @@ export class InfiniteScrollerComponent implements OnInit, OnChanges, OnDestroy, 
   protected readonly breakpointService = inject(BreakpointService);
 
   scrollContainer = viewChild.required<ElementRef<HTMLDivElement>>('scroller');
+  imageZoom = viewChild(ImageZoomDirective);
   pullToLoadNext = viewChild<PullToLoadComponent>('pullToLoadNext');
   ignoreNextScrollEvent = signal(false);
+  isZoomedIn = computed(() => this.imageZoom()?.zoomedIn() ?? false);
 
   get scrollElement(): HTMLElement {
     return this.isFullscreenMode ? this.readerElemRef.nativeElement : this.document.body;
@@ -559,6 +561,10 @@ export class InfiniteScrollerComponent implements OnInit, OnChanges, OnDestroy, 
     for (const image of images) {
       // Get the bounding rectangle of the image.
       const rect = image.getBoundingClientRect();
+
+      if (!this.isElementVisible(image)) {
+        continue;
+      }
 
       // Calculate the distance of the current image to the top of the viewport.
       const distanceToTop = Math.abs(rect.top);
