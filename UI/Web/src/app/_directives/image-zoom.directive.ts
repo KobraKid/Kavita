@@ -131,9 +131,6 @@ export class ImageZoomDirective {
   private lastPanTime = 0;
   /** The active inertial pan animation frame */
   private momentumFrame?: number;
-  /** The local Y coordinate captured when infinite-reader zoom begins */
-  private infiniteZoomFocalY?: number;
-
   /** The scalar for zooming with the mouse wheel */
   private readonly zoomScalar = 0.0015;
   /** The maximum zoom level */
@@ -380,7 +377,6 @@ export class ImageZoomDirective {
     this.scale = 1;
     this.translateX = 0;
     this.translateY = 0;
-    this.infiniteZoomFocalY = undefined;
     this.pinchDistance = 0;
     this.isPanning = false;
     this.updateTransform();
@@ -454,24 +450,21 @@ export class ImageZoomDirective {
     if (this.isInfiniteScroller()) {
       const scrollTop = this.getInfiniteScrollTop();
       if (isReset) {
+        const resetScrollTop = scrollTop - this.translateY;
         this.scale = 1;
         this.translateX = 0;
         this.translateY = 0;
-        this.infiniteZoomFocalY = undefined;
         this.updateTransform();
-        this.restoreInfiniteScrollTop(scrollTop);
+        this.restoreInfiniteScrollTop(resetScrollTop);
         return;
-      }
-
-      if (this.infiniteZoomFocalY === undefined || previousScale === 1) {
-        this.infiniteZoomFocalY = (clientY - rect.top) / previousScale;
       }
 
       this.scale = nextScaleClamped;
 
       const focalTranslateX = clientX - layoutCenterX - imagePointX * nextScaleClamped;
       [this.translateX] = this.clampTranslation(focalTranslateX, 0);
-      this.translateY = this.infiniteZoomFocalY * (1 - nextScaleClamped);
+      const focalY = (clientY - rect.top) / previousScale;
+      this.translateY += focalY * (previousScale - nextScaleClamped);
       this.updateTransform();
       this.restoreInfiniteScrollTop(scrollTop);
       return;
